@@ -1,15 +1,14 @@
 #!/usr/bin/env node
-// NovelAI en 词典提取与对照工具
+// NovelAI en 词典提取与对照工具（Turbopack 构建）
 //
 // 用法: node tools/extract-en-dict.mjs
 //
 // 功能:
-//   1. 从 novelai.net 当前构建动态定位并提取原始 en 语言字典（与 userscript 相同的定位思路）
+//   1. 抓取 novelai.net 首页，逐个下载其引用的 JS chunk，
+//      在其中定位 en 语言字典模块（源码特征 lang:"en" + 结构校验）并提取字典对象字面量
 //   2. 展平（点分键路径，数组值保持数组）后写入 dict/en.json
 //   3. 与上一版 dict/en.json 对比：新增 / 移除 / 内容变化
 //   4. 与 novelai-cn.user.js 的 ZH_DICT 对比：未翻译的新键、en 内容已变化而翻译可能过时的键
-//
-// 注意: 假设字典模块是纯数据模块（不 require 其他模块）。若未来构建违反此假设，需扩展 mock runtime。
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -26,54 +25,66 @@ async function fetchText(url) {
   return res.text();
 }
 
-// 在 mock webpack runtime 中注册 chunk 的模块工厂，再按源码特征 + 导出结构定位 en 字典模块
-function extractEnDict(chunkSrc) {
-  const factories = {};
-  const cache = {};
-  function reqFn(id) {
-    if (cache[id] !== undefined) return cache[id].exports;
-    const module = { exports: {} };
-    cache[id] = module;
-    try {
-      factories[id].call(module.exports, module, module.exports, reqFn);
-    } catch (e) {
-      delete cache[id];
-      throw e;
-    }
-    return module.exports;
+// ---- 源码级提取：模板感知的括号配对，从 {lang:"en" 切出完整对象字面量 ----
+function skipQuoted(text, i, quote) {
+  i++;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === '\\') { i += 2; continue; }
+    if (c === quote) return i + 1;
+    i++;
   }
-  reqFn.m = factories;
-  reqFn.d = (t, defs) => {
-    for (const k in defs) {
-      if (!Object.prototype.hasOwnProperty.call(t, k)) {
-        Object.defineProperty(t, k, { enumerable: true, get: defs[k] });
-      }
-    }
-  };
-  const wp = [];
-  wp.push = (chunk) => {
-    for (const id in chunk[1]) factories[id] = chunk[1][id];
-    // runtime 回调（chunk[2]）不需要执行：字典模块是纯数据
-  };
-  globalThis.self = globalThis;
-  globalThis.webpackChunk_N_E = wp;
-  (0, eval)(chunkSrc);
+  return i;
+}
 
-  for (const id in reqFn.m) {
-    let f;
-    try { f = reqFn.m[id]; } catch { continue; }
-    if (typeof f !== 'function') continue;
-    let src;
-    try { src = Function.prototype.toString.call(f); } catch { continue; }
-    if (!src.includes('lang:"en"') || !src.includes('menubar:{')) continue;
-    let mod;
-    try { mod = reqFn(id); } catch { continue; }
-    const A = mod && mod.A;
-    if (A && typeof A === 'object' && A.lang === 'en' && A.menubar && A.general && A.tier) {
-      return A;
+function skipTemplate(text, i) {
+  i++; // 跳过起始反引号
+  while (i < text.length) {
+    const c = text[i];
+    if (c === '\\') { i += 2; continue; }
+    if (c === '\u0060') { i++; break; }
+    if (c === '$' && text[i + 1] === '{') {
+      i += 2;
+      let ed = 1;
+      while (i < text.length && ed > 0) {
+        const e = text[i];
+        if (e === '"' || e === "'") { i = skipQuoted(text, i, e); continue; }
+        if (e === '\u0060') { i = skipTemplate(text, i); continue; }
+        if (e === '{') ed++;
+        else if (e === '}') ed--;
+        i++;
+      }
+      continue;
     }
+    i++;
   }
-  throw new Error('en dict module not found in chunk');
+  return i;
+}
+
+function extractLiteral(text, startIdx) {
+  let depth = 0;
+  let i = startIdx;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '"' || ch === "'") { i = skipQuoted(text, i, ch); continue; }
+    if (ch === '\u0060') { i = skipTemplate(text, i); continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) return text.slice(startIdx, i + 1); }
+    i++;
+  }
+  return null;
+}
+
+function extractEnDictFromChunk(src) {
+  const keyIdx = src.indexOf('{lang:"en"');
+  if (keyIdx === -1) return null;
+  const lit = extractLiteral(src, keyIdx);
+  if (!lit) return null;
+  try {
+    const dict = new Function('return (' + lit + ');')();
+    if (dict && dict.lang === 'en' && dict.general && dict.menubar && dict.tier) return dict;
+  } catch (e) { /* 字面量切错则忽略 */ }
+  return null;
 }
 
 function flatten(o, prefix = '', out = {}) {
@@ -99,16 +110,23 @@ function parseZhDict(script) {
 }
 
 // ---- 主流程 ----
-console.log('[1/4] 抓取首页…');
+console.log('[1/4] 抓取首页并收集 chunk 列表…');
 const html = await fetchText('https://novelai.net/');
-const appMatch = html.match(/\/_next\/static\/chunks\/pages\/_app-[a-z0-9]+\.js/);
-if (!appMatch) throw new Error('首页 HTML 中未找到 _app chunk');
-const chunkUrl = 'https://novelai.net' + appMatch[0];
-console.log('[2/4] 下载 chunk:', chunkUrl);
-const chunkSrc = await fetchText(chunkUrl);
-console.log('      chunk 大小:', chunkSrc.length, 'bytes');
+const chunkUrls = [...new Set([...html.matchAll(/\/_next\/static\/chunks\/[^"\s]+\.js/g)].map(m => m[0]))];
+if (!chunkUrls.length) throw new Error('首页 HTML 中未找到任何 chunk');
+console.log('      共', chunkUrls.length, '个 chunk');
 
-const dict = extractEnDict(chunkSrc);
+let dict = null;
+let hitUrl = '';
+for (const u of chunkUrls) {
+  const url = 'https://novelai.net' + u;
+  const src = await fetchText(url);
+  dict = extractEnDictFromChunk(src);
+  if (dict) { hitUrl = url; break; }
+}
+if (!dict) throw new Error('在所有 chunk 中都未找到 en 字典模块');
+console.log('[2/4] 找到字典:', hitUrl);
+
 const flat = sortKeys(flatten(dict));
 console.log('[3/4] 提取到 en 字典:', Object.keys(flat).length, '个键');
 

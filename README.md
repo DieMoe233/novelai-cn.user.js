@@ -4,7 +4,7 @@
 
 ## 说明
 
-- `novelai-cn.user.js` —— 油猴脚本本体。通过 webpack 反射动态定位站点运行时 en 语言字典并改写为中文（不依赖构建产物中的模块 ID）。
+- `novelai-cn.user.js` —— 油猴脚本本体。通过反射动态定位站点运行时 en 语言字典并改写为中文（不依赖构建产物中的模块 ID；当前站点为 Turbopack 构建，脚本 hook `globalThis.TURBOPACK`）。
 - `dict/en.json` —— 站点当前构建的原始英文词典参照（展平的点分键路径，数组值保持数组），由维护工具自动生成。
 - `tools/extract-en-dict.mjs` —— 维护工具：从 novelai.net 当前构建重新提取 en 词典、更新 `dict/en.json`，并输出差异报告。
 
